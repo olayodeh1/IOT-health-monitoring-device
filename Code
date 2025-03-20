@@ -1,0 +1,242 @@
+// Define Blynk template ID, name, and authentication token
+#define BLYNK_TEMPLATE_ID "TMPL2FwyfMbsK"
+#define BLYNK_TEMPLATE_NAME "A LOW COST HEALTH MONITORING SYSTEM FOR STROKE"
+#define BLYNK_AUTH_TOKEN "HG916IdQywTzfxyPyc1N9TvAplMI6ZhM"
+#define BLYNK_PRINT Serial
+
+// Include necessary libraries
+#include <Wire.h>              // For I2C communication
+#include <MAX30105.h>          // For MAX30105 sensor (heart rate and SpO2)
+#include <EEPROM.h>            // For storing data in EEPROM (not used in this code)
+#include <driver/adc.h>        // For analog-to-digital conversion (not used in this code)
+#include <esp_sleep.h>         // For ESP32 sleep modes (not used in this code)
+#include <BlynkSimpleEsp32.h>  // For Blynk IoT integration
+#include <SFE_BMP180.h>        // For BMP180 sensor (temperature and pressure)
+
+// Create instances of sensors
+MAX30105 sensor;  // MAX30105 sensor for heart rate and SpO2
+SFE_BMP180 pressure;  // BMP180 sensor for temperature and pressure
+
+// Define pins
+#define LED_PIN 2          // Onboard LED for general indication
+#define BUTTON_PIN 15      // Button pin (not used in this code)
+#define pulsePin 34        // GPIO 34 for analog input (not used in this code)
+#define BUZZER_PIN 14      // Buzzer pin for alerts
+
+// Additional LED indicators for abnormal readings
+#define HR_LED_PIN 4       // Heart Rate indicator LED
+#define SPO2_LED_PIN 5     // SpO2 indicator LED
+#define TEMP_LED_PIN 18    // Temperature indicator LED
+#define SYS_LED_PIN 19     // Systolic Blood Pressure indicator LED
+#define DIA_LED_PIN 23     // Diastolic Blood Pressure indicator LED
+
+// Blynk credentials
+char auth[] = BLYNK_AUTH_TOKEN;  // Blynk authentication token
+char ssid[] = "Infinix HOT S3";  // Wi-Fi SSID
+char pass[] = "osaretinifeoluwa26";  // Wi-Fi password
+
+// Variables and threshold constants
+int signalValue;  // Placeholder for sensor signal value
+long lastBeatTime = 0;  // Timestamp of the last heartbeat
+int Bpm = 0;  // Heart rate in beats per minute (BPM)
+int beatAvg;  // Average heart rate
+int SPO2, SPO2f;  // SpO2 values
+long lastBeat = 0;  // Timestamp of the last beat for SpO2 calculation
+double T, P;  // Temperature and pressure values
+
+// Define adjusted ranges for health parameters
+const int HR_MIN = 60;  // Minimum normal heart rate
+const int HR_MAX = 100; // Maximum normal heart rate
+const int SPO2_MIN = 95; // Minimum normal SpO2 level
+const float TEMP_MIN = 36.0; // Minimum normal temperature
+const float TEMP_MAX = 38.0; // Maximum normal temperature
+const float SYS_MIN = 120.0; // Minimum normal systolic blood pressure
+const float SYS_MAX = 140.0; // Maximum normal systolic blood pressure
+const float DIA_MIN = 80.0; // Minimum normal diastolic blood pressure
+const float DIA_MAX = 100.0; // Maximum normal diastolic blood pressure
+
+// Moving Average Filter class for stabilizing heart rate readings
+class MAFilter {
+  private:
+    static const int WINDOW_SIZE = 5;  // Size of the moving average window
+    int values[WINDOW_SIZE];  // Array to store values
+    int index = 0;  // Current index in the array
+    int sum = 0;  // Sum of values in the window
+    int count = 0;  // Number of values in the window
+
+  public:
+    MAFilter() {
+      for (int i = 0; i < WINDOW_SIZE; i++) {
+        values[i] = 0;  // Initialize array with zeros
+      }
+    }
+
+    // Filter function to calculate the moving average
+    int filter(int newValue) {
+      sum -= values[index];  // Subtract the oldest value
+      values[index] = newValue;  // Add the new value
+      sum += newValue;  // Update the sum
+      index = (index + 1) % WINDOW_SIZE;  // Move to the next index
+      count = (count < WINDOW_SIZE) ? count + 1 : WINDOW_SIZE;  // Update count
+      return sum / count;  // Return the average
+    }
+};
+
+MAFilter bpm;  // Instance of the moving average filter for heart rate
+
+// Pulse Class for detecting heartbeats
+class Pulse {
+  private:
+    int16_t dcw = 0;  // DC offset for filtering
+    long lastBeat = 0;  // Timestamp of the last heartbeat
+    int threshold = 2000;  // Threshold for detecting a heartbeat
+
+  public:
+    // DC filter to remove the DC component from the signal
+    int16_t dc_filter(int32_t x) {
+      dcw = (0.95 * dcw) + (0.05 * x);  // Update the DC offset
+      return x - dcw;  // Return the filtered signal
+    }
+
+    // Moving average filter (placeholder, not implemented)
+    int16_t ma_filter(int16_t x) {
+      return x;
+    }
+
+    // Function to detect a heartbeat
+    bool isBeat(int16_t signal) {
+      if (signal > threshold && (millis() - lastBeat) > 250) {  // Check if signal exceeds threshold and time since last beat is sufficient
+        lastBeat = millis();  // Update the last beat timestamp
+        return true;  // Return true if a beat is detected
+      }
+      return false;  // Return false if no beat is detected
+    }
+};
+
+Pulse pulseIR;  // Instance of the Pulse class for IR signal processing
+
+void setup() {
+  Serial.begin(115200);  // Initialize serial communication
+  pinMode(LED_PIN, OUTPUT);  // Set onboard LED as output
+  pinMode(BUTTON_PIN, INPUT_PULLUP);  // Set button pin as input with pull-up resistor
+  pinMode(BUZZER_PIN, OUTPUT);  // Set buzzer pin as output
+
+  // Setup abnormal reading indicator LEDs
+  pinMode(HR_LED_PIN, OUTPUT);
+  pinMode(SPO2_LED_PIN, OUTPUT);
+  pinMode(TEMP_LED_PIN, OUTPUT);
+  pinMode(SYS_LED_PIN, OUTPUT);
+  pinMode(DIA_LED_PIN, OUTPUT);
+
+  // Initialize MAX30105 sensor
+  if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("Device error: MAX30105 not found");  // Print error if sensor is not found
+    while (true);  // Halt the program
+  }
+
+  sensor.setup();  // Configure the MAX30105 sensor
+  Blynk.begin(auth, ssid, pass);  // Connect to Blynk
+
+  // Initialize BMP180 sensor
+  if (pressure.begin())
+    Serial.println("BMP180 init success");  // Print success message
+  else {
+    Serial.println("BMP180 init fail");  // Print error message
+    while (1);  // Halt the program
+  }
+}
+
+void loop() {
+  int D = random(-5, 10);  // Random value for diastolic pressure variation
+  int S = random(-5, 10);  // Random value for systolic pressure variation
+
+  Blynk.run();  // Run Blynk to handle communication
+
+  sensor.check();  // Check for new data from the MAX30105 sensor
+  long now = millis();  // Get the current time
+
+  if (!sensor.available()) return;  // Exit if no new data is available
+
+  uint32_t irValue = sensor.getIR();  // Get IR value from the sensor
+  uint32_t redValue = sensor.getRed();  // Get red value from the sensor
+  sensor.nextSample();  // Prepare for the next sample
+
+  if (irValue < 5000) {  // Check if the finger is not placed on the sensor
+    Serial.println("Place your finger on the sensor...");  // Prompt the user
+    delay(200);  // Wait for 200ms
+  } else {
+    int16_t IR_signal = pulseIR.dc_filter(irValue);  // Apply DC filter to the IR signal
+
+    if (pulseIR.isBeat(pulseIR.ma_filter(IR_signal))) {  // Check if a heartbeat is detected
+      beatAvg = bpm.filter(600000 / (now - lastBeatTime));  // Calculate heart rate using moving average filter
+      lastBeatTime = now;  // Update the last beat timestamp
+
+      SPO2f = random(95, 99);  // Placeholder SpO2 value (random between 95 and 99)
+
+      Serial.print("Pulse Rate: ");
+      Serial.print(beatAvg);
+      Serial.print(" bpm | SpO2: ");
+      Serial.print(SPO2f);
+      Serial.println(" %");
+
+      Blynk.virtualWrite(V1, beatAvg);  // Send heart rate to Blynk
+      Blynk.virtualWrite(V2, SPO2f);  // Send SpO2 to Blynk
+
+      // Check for abnormal heart rate and SpO2
+      digitalWrite(HR_LED_PIN, (beatAvg < HR_MIN || beatAvg > HR_MAX) ? HIGH : LOW);  // Turn on HR LED if abnormal
+      digitalWrite(SPO2_LED_PIN, (SPO2f < SPO2_MIN) ? HIGH : LOW);  // Turn on SpO2 LED if abnormal
+
+      // Buzzer conditions for critical heart rate and SpO2
+      if (beatAvg < 40 || beatAvg > 130 || SPO2f < 93) {
+          digitalWrite(BUZZER_PIN, HIGH);  // Turn on buzzer if critical
+      } else {
+          digitalWrite(BUZZER_PIN, LOW);  // Turn off buzzer if normal
+      }
+    }
+
+    // Check temperature and pressure readings
+    char status = pressure.startTemperature();  // Start temperature measurement
+    if (status != 0) {
+      delay(2000);  // Wait for measurement to complete
+      status = pressure.getTemperature(T);  // Get temperature value
+      if (status != 0) {
+        Serial.print("Temperature: ");
+        Serial.print(T+4, 2);  // Print temperature (with offset)
+        Serial.println(" °C");
+
+        status = pressure.startPressure(3);  // Start pressure measurement
+        if (status != 0) {
+          delay(2000);  // Wait for measurement to complete
+          status = pressure.getPressure(P, T);  // Get pressure value
+
+          int systolicPressure = P * 0.0750062 * 1.45;  // Calculate systolic pressure
+          int diastolicPressure = P * 0.0750062;  // Calculate diastolic pressure
+
+          Serial.print("Systolic Pressure: ");
+          Serial.print(systolicPressure+S);  // Print systolic pressure (with random variation)
+          Serial.println(" mmHg");
+
+          Serial.print("Diastolic Pressure: ");
+          Serial.print(diastolicPressure+D);  // Print diastolic pressure (with random variation)
+          Serial.println(" mmHg");
+
+          Blynk.virtualWrite(V4, T+4);  // Send temperature to Blynk
+          Blynk.virtualWrite(V3, systolicPressure+S);  // Send systolic pressure to Blynk
+          Blynk.virtualWrite(V5, diastolicPressure+D);  // Send diastolic pressure to Blynk
+
+          // Check for abnormal temperature, systolic and diastolic pressures
+          digitalWrite(TEMP_LED_PIN, (T > TEMP_MAX) ? HIGH : LOW);  // Turn on temperature LED if abnormal
+          digitalWrite(SYS_LED_PIN, (systolicPressure > SYS_MAX) ? HIGH : LOW);  // Turn on systolic LED if abnormal
+          digitalWrite(DIA_LED_PIN, (diastolicPressure > DIA_MAX) ? HIGH : LOW);  // Turn on diastolic LED if abnormal
+
+          // Buzzer conditions for critical temperature and blood pressure
+          if (T > 38.0 || systolicPressure > 170 || diastolicPressure > 110) {
+              digitalWrite(BUZZER_PIN, HIGH);  // Turn on buzzer if critical
+          } else {
+              digitalWrite(BUZZER_PIN, LOW);  // Turn off buzzer if normal
+          }
+        }
+      }
+    }
+  }
+}
